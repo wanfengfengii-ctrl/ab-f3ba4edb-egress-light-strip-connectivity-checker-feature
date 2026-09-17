@@ -16,13 +16,14 @@
 
 ```
 app/
-  main.py          FastAPI 入口、路由与结构化错误处理
-  models.py        Pydantic 请求/响应/错误模型
+  main.py          FastAPI 入口、路由与结构化错误处理（create_app 工厂）
+  models.py        Pydantic 请求/响应/错误模型与排空状态契约
   validation.py    输入契约校验（整图拒绝的全部规则）
   connectivity.py  四邻接 BFS 图搜索
   inspector.py     可达性判定与证据坐标计算
-tests/             pytest：连通算法边界判据 + 输入校验 + 端到端 API
-acceptance.py      一次性验收脚本（verify 服务使用）
+  drain.py         排空协调器（接纳/排空中/已排空状态机 + 在途计数）与检查准入中间件
+tests/             pytest：连通算法边界判据 + 输入校验 + 端到端 API + 排空生命周期
+acceptance.py      一次性验收脚本（verify 服务使用；末尾的排空检查会排空实例）
 Dockerfile         python:3.12-slim 镜像（同时打包测试与 docker-compose.yml，供 verify 容器内校验）
 docker-compose.yml api 服务 + verify 一次性验收服务
 ```
@@ -135,6 +136,40 @@ curl -s -X POST http://localhost:8000/inspect \
 | `EXIT_ID_DUPLICATE` | 编号重复 |
 | `SCHEMA_ERROR` | 请求体不符合 JSON 结构（类型错误、缺字段、多字段、非法 JSON 等） |
 
+### `POST /drain`
+
+滚动更新前的优雅排空。调用后服务沿 `ACCEPTING → DRAINING → DRAINED`
+单向转换：立即停止接纳新的 `POST /inspect`，并等待**此前已准入**的检查全部
+结束（成功、422 拒绝、内部异常、请求取消都会在 finally 路径释放在途计数，
+排空不会永久等待），随后返回：
+
+```bash
+curl -s -X POST http://localhost:8000/drain
+```
+
+```json
+{"state": "DRAINED"}
+```
+
+- **并发幂等**：并发调用 `/drain` 复用同一次转换，所有调用在在途计数归零后
+  得到完全相同的响应；排空后再次调用立即返回同一结果。
+- **转换后到达的检查**收到结构化 `503`，`detail.state` 携带当前状态
+  （`DRAINING` 或 `DRAINED`）：
+
+```json
+{
+  "detail": {
+    "code": "SERVICE_DRAINING",
+    "message": "The service is draining for a rolling update: new inspections are rejected while previously admitted ones finish.",
+    "state": "DRAINING"
+  }
+}
+```
+
+- **终态**：`DRAINED` 不可撤销，只有进程重启才恢复接纳（无反排空接口）。
+- 排空前已准入的请求不受干扰，仍按原有 `PASS`、`FAIL` 或 `422` 完成；
+  不调用 `/drain` 时，健康检查、端口配置与验收流程完全不变。
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。交互式 API 文档见 `/docs`。
@@ -168,7 +203,8 @@ pytest 套件，再对运行中的 API 执行 `acceptance.py` 的实网 HTTP 验
 docker compose --profile verify up --build --abort-on-container-exit --exit-code-from verify
 ```
 
-也可对任意已运行的实例单独执行验收脚本：
+也可对任意已运行的实例单独执行验收脚本（注意：脚本末尾的排空检查会
+调用 `/drain` 永久排空该实例，重跑前需重启 API 进程）：
 
 ```bash
 API_BASE_URL=http://localhost:8000 python acceptance.py
@@ -185,3 +221,9 @@ pytest
 对角不导通、空位隔断、网格边缘不回绕（Python 负索引陷阱）、
 证据坐标取分量首单元、同分量多出口共享证据、Unicode 码点排序，
 以及全部输入拒绝规则与端到端 PASS/FAIL 报文。
+
+排空生命周期（tests/test_drain.py）用可控阻塞的检查请求证明：
+排空会等待已准入的旧请求、以结构化 503 拒绝新请求，并在成功、
+校验拒绝、内部异常与请求取消四条 finally 路径后解除等待；
+并发排空调用共享同一次转换并返回相同结果；不调用排空时普通检查
+报文无任何回归。

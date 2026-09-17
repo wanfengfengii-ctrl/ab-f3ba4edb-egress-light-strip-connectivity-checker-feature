@@ -5,6 +5,10 @@ Used by the `verify` docker-compose service, but also runnable directly:
     API_BASE_URL=http://localhost:8000 python acceptance.py
 
 Exits 0 when every check passes, 1 otherwise.
+
+The final checks call POST /drain, which permanently drains the instance
+(only a process restart resumes acceptance), so they must stay last and
+re-running this script against the same process requires an API restart.
 """
 from __future__ import annotations
 
@@ -124,6 +128,27 @@ def check_health():
     return False, f"healthz returned {status}: {body}"
 
 
+def check_drain_returns_drained_and_is_idempotent():
+    for attempt in ("first", "second"):
+        status, body = _request("POST", "/drain")
+        if status != 200 or body != {"state": "DRAINED"}:
+            return False, f"{attempt} drain returned {status}: {body}"
+    return True, ""
+
+
+def check_drained_service_rejects_inspections_but_stays_healthy():
+    status, body = _request("POST", "/inspect", PASS_PAYLOAD)
+    if status != 503:
+        return False, f"expected 503 after drain, got {status}: {body}"
+    detail = body.get("detail", {})
+    if detail.get("code") != "SERVICE_DRAINED" or detail.get("state") != "DRAINED":
+        return False, f"unexpected 503 body: {body}"
+    status, body = _request("GET", "/healthz")
+    if status != 200 or body != {"status": "ok"}:
+        return False, f"healthz after drain returned {status}: {body}"
+    return True, ""
+
+
 CHECKS = [
     ("health endpoint responds", check_health),
     (
@@ -209,6 +234,16 @@ CHECKS = [
             422,
             predicate=has_issue("EXIT_ID_MISSING"),
         ),
+    ),
+    # Drain checks must stay last: POST /drain permanently drains the
+    # instance, and only a process restart resumes acceptance.
+    (
+        "drain returns DRAINED and repeated drains agree",
+        check_drain_returns_drained_and_is_idempotent,
+    ),
+    (
+        "drained service rejects inspections with 503 but stays healthy",
+        check_drained_service_rejects_inspections_but_stays_healthy,
     ),
 ]
 
