@@ -124,6 +124,33 @@ def check_health():
     return False, f"healthz returned {status}: {body}"
 
 
+# Drain checks run last: once drained the process only admits inspections
+# again after a restart, so no further /inspect checks may follow them.
+def check_drain_while_idle():
+    status, body = _request("POST", "/drain")
+    if status != 200:
+        return False, f"expected HTTP 200, got {status}: {body}"
+    if body != {"status": "DRAINED", "state": "DRAINED", "in_flight": 0}:
+        return False, f"unexpected drain body: {body}"
+    # A second call joins the same completed transition.
+    again_status, again_body = _request("POST", "/drain")
+    if again_status != 200 or again_body != body:
+        return False, f"repeated drain is not idempotent: {again_status} {again_body}"
+    return True, ""
+
+
+def check_inspect_rejected_after_drain():
+    status, body = _request("POST", "/inspect", PASS_PAYLOAD)
+    if status != 503:
+        return False, f"expected HTTP 503, got {status}: {body}"
+    detail = body.get("detail", {})
+    if detail.get("code") != "SERVICE_UNAVAILABLE":
+        return False, f"unexpected detail.code: {detail.get('code')!r}"
+    if detail.get("state") != "DRAINED" or detail.get("in_flight") != 0:
+        return False, f"503 must name the terminal state and zero count: {detail}"
+    return True, ""
+
+
 CHECKS = [
     ("health endpoint responds", check_health),
     (
@@ -210,6 +237,10 @@ CHECKS = [
             predicate=has_issue("EXIT_ID_MISSING"),
         ),
     ),
+    # Drain checks run last: once drained the process only accepts inspections
+    # again after a restart, so no further /inspect checks may follow them.
+    ("drain completes while idle", check_drain_while_idle),
+    ("inspections are rejected with 503 after drain", check_inspect_rejected_after_drain),
 ]
 
 

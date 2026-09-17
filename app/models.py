@@ -64,3 +64,32 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: ErrorDetail
+
+
+# Lifecycle of the single-process drain coordinator.
+#   ACCEPTING - inspections are admitted and counted as in-flight
+#   DRAINING  - POST /drain has been observed; new inspections get a 503 while
+#               already-admitted ones run to completion
+#   DRAINED   - the in-flight count reached zero; terminal until process restart
+DrainState = Literal["ACCEPTING", "DRAINING", "DRAINED"]
+
+
+class DrainResponse(BaseModel):
+    """Shared contract for POST /drain: returned once every old check finished."""
+
+    status: Literal["DRAINED"] = "DRAINED"
+    state: DrainState
+    in_flight: int = Field(ge=0)
+
+
+class DrainRejectionDetail(BaseModel):
+    """Structured 503 payload naming the drain state observed on arrival."""
+
+    code: Literal["SERVICE_UNAVAILABLE"]
+    message: str
+    state: DrainState
+    in_flight: int = Field(ge=0)
+
+
+class DrainRejectionResponse(BaseModel):
+    detail: DrainRejectionDetail

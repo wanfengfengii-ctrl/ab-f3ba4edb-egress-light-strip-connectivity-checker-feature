@@ -16,12 +16,13 @@
 
 ```
 app/
-  main.py          FastAPI 入口、路由与结构化错误处理
-  models.py        Pydantic 请求/响应/错误模型
+  main.py          FastAPI 入口、路由、排空准入中间件与结构化错误处理
+  models.py        Pydantic 请求/响应/错误/排空模型（路由与协调器共享的契约）
+  drain.py         单进程排空协调器（ACCEPTING/DRAINING/DRAINED + 在途计数）
   validation.py    输入契约校验（整图拒绝的全部规则）
   connectivity.py  四邻接 BFS 图搜索
   inspector.py     可达性判定与证据坐标计算
-tests/             pytest：连通算法边界判据 + 输入校验 + 端到端 API
+tests/             pytest：连通算法边界判据 + 输入校验 + 端到端 API + 排空并发验收
 acceptance.py      一次性验收脚本（verify 服务使用）
 Dockerfile         python:3.12-slim 镜像（同时打包测试与 docker-compose.yml，供 verify 容器内校验）
 docker-compose.yml api 服务 + verify 一次性验收服务
@@ -137,7 +138,49 @@ curl -s -X POST http://localhost:8000/inspect \
 
 ### `GET /healthz`
 
-健康检查，返回 `{"status": "ok"}`。交互式 API 文档见 `/docs`。
+健康检查，返回 `{"status": "ok"}`，排空期间不受影响。交互式 API 文档见 `/docs`。
+
+### `POST /drain`
+
+滚动更新前的排空入口。调用后服务立即停止接纳新的检查请求，并在**此前已准入的
+`POST /inspect` 全部结束后**返回 `DRAINED`：
+
+```json
+{"status": "DRAINED", "state": "DRAINED", "in_flight": 0}
+```
+
+排空协调器（`app/drain.py`）在单进程内以一个 `threading.Condition` 原子维护：
+
+| 状态 | 含义 |
+| --- | --- |
+| `ACCEPTING` | 正常接纳检查，准入时在途计数加一 |
+| `DRAINING` | 已观察到 `/drain`；新检查返回 503，等待在途计数归零 |
+| `DRAINED` | 在途计数归零，转换完成；终态，**只能随进程重启恢复接纳** |
+
+契约要点：
+
+- **并发 `/drain` 幂等**：只有第一个调用执行 `ACCEPTING → DRAINING` 转换，
+  其余调用复用同一次转换、一起等待，计数归零后全部返回相同的 `DRAINED` 结果；
+  排空后再次调用也只是观察已完成的转换。
+- **准入与计数原子**：检查请求要么在转换前完成计数（按原有 `PASS`/`FAIL`/`422`
+  跑完），要么在转换后被拒。成功返回、校验拒绝（422）、内部异常（500）或请求
+  取消都在 `finally` 路径释放计数，排空不会永久等待。
+- **排空期间的新请求**：转换（含 `DRAINING` 与 `DRAINED`）后到达的 `POST /inspect`
+  不解析请求体，直接返回结构化 503，`detail.state` 给出到达时观察到的状态，
+  `detail.in_flight` 给出当时仍在途的旧请求数：
+
+```json
+{
+  "detail": {
+    "code": "SERVICE_UNAVAILABLE",
+    "message": "The inspection service is draining or drained and no longer accepts new inspection requests.",
+    "state": "DRAINING",
+    "in_flight": 1
+  }
+}
+```
+
+- 不调用 `/drain` 时，健康检查、端口配置与验收流程与以往完全一致。
 
 ## 运行
 
@@ -185,3 +228,8 @@ pytest
 对角不导通、空位隔断、网格边缘不回绕（Python 负索引陷阱）、
 证据坐标取分量首单元、同分量多出口共享证据、Unicode 码点排序，
 以及全部输入拒绝规则与端到端 PASS/FAIL 报文。
+
+`tests/test_drain.py` 用可控阻塞检查（`threading.Event` 闸门）验收排空契约：
+排空等待旧请求、以带状态的结构化 503 拒绝新请求、旧请求的正常完成 / 422 /
+内部异常 / 请求取消四种路径都能解除等待、五个并发 `/drain` 复用同一次转换并
+返回一致结果，以及不排空时健康检查与普通 PASS/FAIL/422 报文无回归。
